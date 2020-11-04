@@ -34,30 +34,31 @@ using SingleThreadedResource = Resource<size_t>;
 using MultiThreadedResource = Resource<std::atomic<size_t>>;
 
 struct DelayedResource {
-	struct Page {
-		const static size_t size = 4096;
-		static size_t generator;
+	struct Task;
+	static const size_t size = 4096;
+	static size_t generator;
+	static thread_local Task* thread_own;
+	static std::mutex mutex;
+	static std::condition_variable cvar;
+	static queue<Task*> task_queue;
+	static queue<size_t> nom_queue;
+	static vector<DelayedResource*> to_delete;
+	static vector<Task*> pool;
+	static bool tagged_gen;
+
+	enum {
+		PTR = 0b00,
+		TAG = 0b01,
+		INCOMPLETE = 0b10,
+		COMPLETE = 0b11,
+	};
+	struct Task {
+		size_t* gen_ptr;
 		size_t start_gen;
-		size_t end_gen;
 		DelayedResource* buffer[size];
 		DelayedResource** incs;
 		DelayedResource** decs;
-		static thread_local Page* thread_own;
-		static std::mutex mutex;
-		static std::condition_variable cvar;
-		static queue<Page*> gen_queue; // pages to be processed ordered by start_gen.
-		static queue<size_t> check_queue; // gen|1 or PtrToResource|0
-		static vector<DelayedResource*> to_delete;
-		static vector<Page*> pool;
 
-		void init() {
-			end_gen = 0;
-			start_gen = generator += 2;
-			incs = buffer;
-			decs = buffer + size;
-			gen_queue.push(this);
-			thread_own = this;
-		}
 		void inc(DelayedResource* r) {
 			*incs = r;
 			if (++incs == decs)
@@ -68,131 +69,156 @@ struct DelayedResource {
 			if (incs == decs)
 				flush();
 		}
-		void flush(){
-			const std::lock_guard<std::mutex> lock(mutex);
-			end_gen = generator;
-			set_next_page();
-			if (gen_queue.front()->end_gen)
-				cvar.notify_one();
-		}
-		static void set_next_page() {
-			if (pool.empty()) {
-				(new Page)->init();
-			}
-			else {
-				pool.back()->init();
-				pool.pop_back();
-			}
-		}
-		void execute() {
-			check_queue.push(end_gen);
+		void process() {
+			tagged_gen = 0;
 			for (DelayedResource** i = incs; --i >= buffer;) {
 				auto& ct = (*i)->counter;
 				if (ct & 1)
-					ct = 2;
-				else if ((ct += 2) == 0) {
-					ct = end_gen;
-					check_queue.push((size_t)*i);
+					ct = 4;
+				else if ((ct += 4) == 0) {
+					if (!tagged_gen) {
+						tagged_gen = start_gen | TAG;
+						nom_queue.push(tagged_gen);
+					}
+					ct = tagged_gen;
+					nom_queue.push((size_t)*i);
 				}
 			}
 			for (DelayedResource** i = decs; i < buffer + size; i++) {
 				auto& ct = (*i)->counter;
 				if (ct & 1)
-					ct = -2;
-				else if ((ct -= 2) == 0) {
-					ct = end_gen;
-					check_queue.push((size_t)*i);
+					ct = -4;
+				else if ((ct -= 4) == 0) {
+					if (!tagged_gen) {
+						tagged_gen = start_gen | TAG;
+						nom_queue.push(tagged_gen);
+					}
+					ct = tagged_gen;
+					nom_queue.push((size_t)*i);
 				}
 			}
-			size_t g = 0;
-			for (; !check_queue.empty(); check_queue.pop()) {
-				auto i = check_queue.front();
-				if (i & 1) {
-					if ((i - start_gen) & (~(~0u >> 1)))
-						break;
-					g = i;
-				} else if (((DelayedResource*)i)->counter == g) {
-					to_delete.push_back((DelayedResource*)i);
-					((DelayedResource*)i)->counter = 0;
+			*gen_ptr |= COMPLETE;
+			handle_nominated();
+		}
+		static void handle_nominated() {
+			size_t tag = 0;
+			while (!nom_queue.empty()) {
+				auto n = nom_queue.front();
+				switch (n & 3) {
+				case INCOMPLETE: return;
+				case COMPLETE: break;
+				case TAG: tag = n; break;
+				default:
+				{
+					auto* p = (DelayedResource*)n;
+					if (p->counter == tag) {
+						to_delete.push_back(p);
+						p->counter = 0;
+					}
 				}
+				}
+				nom_queue.pop();
 			}
-			if (!to_delete.empty()) {
-				for (auto i : to_delete)
-					delete i;
-				to_delete.clear();
+		}
+		static void flush(){
+			Task* t;
+			{
+				const std::lock_guard<std::mutex> lock(mutex);
+				if (thread_own)
+					task_queue.push(thread_own);
+				if (pool.empty())
+					t = new Task;
+				else {
+					t = pool.back();
+					pool.pop_back();
+				}
+				t->gen_ptr = nullptr;
+				task_queue.push(t);
 			}
+			t->incs = t->buffer;
+			t->decs = t->buffer + size;
+			thread_own = t;
+			cvar.notify_one();
 		}
 	};
 	struct ThreadGuard {
 		ThreadGuard() {
-			Page::set_next_page();
+			Task::flush();
 		}
 		~ThreadGuard() {
-			if (Page::thread_own) {
-				const std::lock_guard<std::mutex> lock(Page::mutex);
-				Page::thread_own->end_gen = Page::generator;
-				if (Page::gen_queue.front()->end_gen)
-					Page::cvar.notify_one();
+			if (thread_own) {
+				task_queue.push(thread_own);
+				thread_own = nullptr;
 			}
 		}
 	};
-	// nnnn1 -> to be deleted in gen nnnn
-	// vvvv0 -> counter with signed overflow
 	size_t counter = 0;
 
 	virtual ~DelayedResource() = default;
 
-	void retain() { Page::thread_own->inc(this); }
-	void release() { Page::thread_own->dec(this); }
+	inline void retain() { thread_own->inc(this); }
+	inline void release() { thread_own->dec(this); }
 	inline void st_release() {
-		if ((counter -= 2) == 0)
-			delete this;
+		if (counter & 1)
+			counter = -4;
+		else if ((counter -= 4) == 0) {
+			if (!tagged_gen) {
+				tagged_gen = generator++ | TAG;
+				nom_queue.push(tagged_gen);
+			}
+			counter = tagged_gen;
+			nom_queue.push((size_t)this);
+		}
 	}
-	static void flush() {
-		Page::thread_own->flush();
-	}
+	static void flush() { thread_own->flush(); }
 	static void start(std::function<void()> root_mutator) {
+		ThreadGuard guard;
 		std::thread t([&] {
 			ThreadGuard guard;
 			root_mutator();
-			Page::cvar.notify_one();
+			cvar.notify_one();
 		});
-		{
-			std::unique_lock<std::mutex> lock(Page::mutex);
-			for (;;) {
-				Page::cvar.wait(lock);
-				for (;;) {
-					if (Page::gen_queue.empty()) {
-						assert(Page::check_queue.empty());
-						t.join();
-						return;
-					}
-					auto p = Page::gen_queue.front();
-					if (!p->end_gen)
-						break;
-					Page::gen_queue.pop();
-					if (Page::gen_queue.size() > 10) {
-						p->execute();
-					} else {
-						lock.unlock();
-						p->execute();
-						lock.lock();
-					}
-					Page::pool.push_back(p);
+		std::unique_lock<std::mutex> lock(mutex);
+		for (;;) {
+			cvar.wait(lock);
+			while (!task_queue.empty()) {
+				auto* t = task_queue.front();
+				task_queue.pop();
+				if (!t->gen_ptr) {
+					t->start_gen = generator += 4;
+					nom_queue.push(t->start_gen | INCOMPLETE);
+					t->gen_ptr = &nom_queue.back();
+				} else {
+					lock.unlock();
+					t->process();
+					lock.lock();
+					pool.push_back(t);
 				}
+			}
+			while (!to_delete.empty()) {
+				tagged_gen = 0;
+				for (auto i : to_delete)
+					delete i;
+				to_delete.clear();
+				Task::handle_nominated();
+			}
+			if (nom_queue.empty()) {
+				t.join();
+				return;
 			}
 		}
 	}
 };
 
-std::mutex DelayedResource::Page::mutex;
-size_t DelayedResource::Page::generator = 1;
-thread_local DelayedResource::Page* DelayedResource::Page::thread_own;
-std::condition_variable DelayedResource::Page::cvar;
-queue<DelayedResource::Page*> DelayedResource::Page::gen_queue;
-queue<size_t> DelayedResource::Page::check_queue; // gen|1 or PtrToResource|0
-vector<DelayedResource::Page*> DelayedResource::Page::pool;
-vector<DelayedResource*> DelayedResource::Page::to_delete;
+std::mutex DelayedResource::mutex;
+size_t DelayedResource::generator = 1;
+thread_local DelayedResource::Task* DelayedResource::thread_own;
+std::condition_variable DelayedResource::cvar;
+queue<DelayedResource::Task*> DelayedResource::task_queue;
+queue<size_t> DelayedResource::nom_queue;
+vector<DelayedResource::Task*> DelayedResource::pool;
+vector<DelayedResource*> DelayedResource::to_delete;
+bool DelayedResource::tagged_gen = 0;
 
 template <typename R>
 struct local;
