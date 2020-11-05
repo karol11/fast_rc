@@ -8,8 +8,8 @@
 #include <functional>
 #include <cassert>
 
-const int LOOPS_COUNT = 10;
-const int TREE_DEPTH =20;
+const int LOOPS_COUNT = 20;
+const int TREE_DEPTH = 15;
 
 using std::queue;
 using std::vector;
@@ -44,7 +44,7 @@ struct DelayedResource {
 	static queue<size_t> nom_queue;
 	static vector<DelayedResource*> to_delete;
 	static vector<Task*> pool;
-	static bool tagged_gen;
+	static size_t tagged_gen;
 
 	enum {
 		PTR = 0b00,
@@ -163,7 +163,7 @@ struct DelayedResource {
 			counter = -4;
 		else if ((counter -= 4) == 0) {
 			if (!tagged_gen) {
-				tagged_gen = generator++ | TAG;
+				tagged_gen = (generator += 4) | TAG;
 				nom_queue.push(tagged_gen);
 			}
 			counter = tagged_gen;
@@ -172,18 +172,23 @@ struct DelayedResource {
 	}
 	static void flush() { thread_own->flush(); }
 	static void start(std::function<void()> root_mutator) {
-		ThreadGuard guard;
-		std::thread t([&] {
-			ThreadGuard guard;
-			root_mutator();
+		std::thread root_thread([&] {
+			{
+				ThreadGuard guard;
+				root_mutator();
+			}
+			task_queue.push(nullptr);
 			cvar.notify_one();
 		});
 		std::unique_lock<std::mutex> lock(mutex);
 		for (;;) {
-			cvar.wait(lock);
-			while (!task_queue.empty()) {
-				auto* t = task_queue.front();
+			cvar.wait(lock, [] { return!task_queue.empty(); });
+			Task* t;
+			do {
+				t = task_queue.front();
 				task_queue.pop();
+				if (!t)
+					break;
 				if (!t->gen_ptr) {
 					t->start_gen = generator += 4;
 					nom_queue.push(t->start_gen | INCOMPLETE);
@@ -194,16 +199,21 @@ struct DelayedResource {
 					lock.lock();
 					pool.push_back(t);
 				}
-			}
+			} while (!task_queue.empty());
 			while (!to_delete.empty()) {
+				lock.unlock();
 				tagged_gen = 0;
 				for (auto i : to_delete)
 					delete i;
 				to_delete.clear();
 				Task::handle_nominated();
+				lock.lock();
 			}
-			if (nom_queue.empty()) {
-				t.join();
+			if (!t) {
+				root_thread.join();
+				assert(task_queue.empty());
+				assert(nom_queue.empty());
+				assert(to_delete.empty());
 				return;
 			}
 		}
@@ -211,14 +221,14 @@ struct DelayedResource {
 };
 
 std::mutex DelayedResource::mutex;
-size_t DelayedResource::generator = 1;
+size_t DelayedResource::generator = 0;
 thread_local DelayedResource::Task* DelayedResource::thread_own;
 std::condition_variable DelayedResource::cvar;
 queue<DelayedResource::Task*> DelayedResource::task_queue;
 queue<size_t> DelayedResource::nom_queue;
 vector<DelayedResource::Task*> DelayedResource::pool;
 vector<DelayedResource*> DelayedResource::to_delete;
-bool DelayedResource::tagged_gen = 0;
+size_t DelayedResource::tagged_gen = 0;
 
 template <typename R>
 struct local;
@@ -343,7 +353,7 @@ int main() {
 		perform_test<MultiThreadedResource>(false, "atomic");
 		perform_test<MultiThreadedResource>(true, "atomic-mt");
 		perform_test<DelayedResource>(false, "delayed");
-		perform_test<DelayedResource>(true, "delayed-mt");
+		// perform_test<DelayedResource>(true, "delayed-mt");
 	}
 	return 0;
 }
