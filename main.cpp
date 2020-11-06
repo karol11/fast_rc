@@ -8,8 +8,8 @@
 #include <functional>
 #include <cassert>
 
-const int LOOPS_COUNT = 20;
-const int TREE_DEPTH = 15;
+const int LOOPS_COUNT = 10;
+const int TREE_DEPTH = 20;
 
 using std::queue;
 using std::vector;
@@ -147,8 +147,10 @@ struct DelayedResource {
 		}
 		~ThreadGuard() {
 			if (thread_own) {
+				const std::lock_guard<std::mutex> lock(mutex);
 				task_queue.push(thread_own);
 				thread_own = nullptr;
+				cvar.notify_one();
 			}
 		}
 	};
@@ -353,7 +355,7 @@ int main() {
 		perform_test<MultiThreadedResource>(false, "atomic");
 		perform_test<MultiThreadedResource>(true, "atomic-mt");
 		perform_test<DelayedResource>(false, "delayed");
-		// perform_test<DelayedResource>(true, "delayed-mt");
+		perform_test<DelayedResource>(true, "delayed-mt");
 	}
 	return 0;
 }
